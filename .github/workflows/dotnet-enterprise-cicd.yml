@@ -421,7 +421,7 @@ jobs:
           /p:TreatWarningsAsErrors=true
           /p:EnforceCodeStyleInBuild=true
  # ─────────────────────────────────────────────────────────
-  # STAGE 6: BUILD DOCKER IMAGE
+  # STAGE 6: BUILD DOCKER New Image
   # ─────────────────────────────────────────────────────────
   build-docker:
     name: Build Docker Image
@@ -512,7 +512,7 @@ jobs:
           path: ./publish
 
   # ─────────────────────────────────────────────────────────
-  # STAGE 8: DEPLOY TO STAGING (Only on develop branch)
+  # STAGE 8: DEPLOY TO STAGING (Only on feature branch)
   # ─────────────────────────────────────────────────────────
   deploy-staging:
     name: Deploy to Staging
