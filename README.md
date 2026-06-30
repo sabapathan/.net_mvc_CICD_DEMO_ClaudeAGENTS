@@ -1,6 +1,6 @@
 # Enterprise E-Commerce API
 
-A production-ready ASP.NET Core REST API for an e-commerce platform, demonstrating enterprise-level architecture patterns, comprehensive CI/CD pipeline, security practices, and code quality standards.
+A production-ready ASP.NET Core REST API for an e-commerce platform, demonstrating enterprise-level architecture patterns, comprehensive CI/CD pipeline, security practices, and code quality standar[...] 
 
 ![.NET](https://img.shields.io/badge/.NET-8.0-purple)
 ![License](https://img.shields.io/badge/License-MIT-green)
@@ -179,9 +179,9 @@ dotnet test EcommerceApi.sln --collect:"XPlat Code Coverage"
    ```
 
 5. **Access Swagger UI**
-   ```
-   https://localhost:5001/swagger
-   ```
+    ```
+    https://localhost:5001/swagger
+    ```
 
 ---
 
@@ -355,3 +355,6 @@ This project is licensed under MIT License - see LICENSE file for details.
 - [SOLID Principles](https://en.wikipedia.org/wiki/SOLID)
 - [GitHub Actions](https://github.com/features/actions)
 - [Entity Framework Core](https://learn.microsoft.com/en-us/ef/core/)
+
+
+<!-- Trigger CI: bump docs -->
