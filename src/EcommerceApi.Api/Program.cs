@@ -2,6 +2,7 @@ using Serilog;
 using FluentValidation;
 using AutoMapper;
 using EcommerceApi.Infrastructure;
+using System.Reflection;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -34,7 +35,7 @@ builder.Services.AddCors(options =>
 builder.Services.AddInfrastructureServices(builder.Configuration);
 
 // Add AutoMapper
-builder.Services.AddAutoMapper(AppDomain.CurrentDomain.GetAssemblies());
+builder.Services.AddAutoMapper((Assembly[])AppDomain.CurrentDomain.GetAssemblies());
 
 // Add FluentValidation
 builder.Services.AddValidatorsFromAssembly(typeof(Program).Assembly);
