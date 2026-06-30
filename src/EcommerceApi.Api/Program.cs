@@ -35,7 +35,7 @@ builder.Services.AddCors(options =>
 builder.Services.AddInfrastructureServices(builder.Configuration);
 
 // Add AutoMapper
-builder.Services.AddAutoMapper((Assembly[])AppDomain.CurrentDomain.GetAssemblies());
+builder.Services.AddAutoMapper(typeof(Program).Assembly);
 
 // Add FluentValidation
 builder.Services.AddValidatorsFromAssembly(typeof(Program).Assembly);
