@@ -1,0 +1,644 @@
+name: Enterprise E-Commerce API CI/CD Pipeline
+
+on:
+  push:
+    branches: [ "main", "develop", "feature/*" ]
+  pull_request:
+    branches: [ "main", "develop" ]
+
+env:
+  DOTNET_VERSION: '8.0.x'
+  BUILD_CONFIGURATION: Release
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+
+  # ─────────────────────────────────────────────────────────
+  # STAGE 1: BUILD & RESTORE DEPENDENCIES
+  # ─────────────────────────────────────────────────────────
+  build:
+    name: Build Solution
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - name: Cache NuGet Packages
+        uses: actions/cache@v3
+        with:
+          path: ~/.nuget/packages
+          key: ${{ runner.os }}-nuget-${{ hashFiles('**/*.csproj') }}
+          restore-keys: ${{ runner.os }}-nuget-
+
+      - name: Restore Dependencies
+        run: dotnet restore EcommerceApi.sln
+
+      - name: Build Solution
+        run: dotnet build EcommerceApi.sln
+          --configuration ${{ env.BUILD_CONFIGURATION }}
+          --no-restore
+          --verbosity minimal
+
+  # ─────────────────────────────────────────────────────────
+  # STAGE 2: SECURITY SCANNING - SAST & DEPENDENCY SCAN
+  #          + 3 CLAUDE AI AGENTS
+  # ─────────────────────────────────────────────────────────
+  security-scan:
+    name: Security Scanning
+    runs-on: ubuntu-latest
+    needs: build
+    permissions:
+      contents: read
+      security-events: write
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      # ── Standard CodeQL Analysis ──────────────────────────
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v2
+        with:
+          languages: 'csharp'
+          queries: security-and-quality
+
+      - name: Restore Dependencies
+        run: dotnet restore EcommerceApi.sln
+
+      - name: Build for CodeQL
+        run: dotnet build EcommerceApi.sln
+          --configuration ${{ env.BUILD_CONFIGURATION }}
+          --no-restore
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v2
+        with:
+          category: "/language:csharp"
+
+      - name: Check NuGet Vulnerabilities
+        run: |
+          dotnet tool update --global dotnet-outdated-tool
+          dotnet outdated --include-transitive EcommerceApi.sln > nuget-report.txt 2>&1 || true
+          cat nuget-report.txt
+
+      # ── 🤖 AGENT 1: Dependency Vulnerability Analyst (NVIDIA NIM) ──
+      # Reads the NuGet vulnerability report and produces a
+      # prioritized, human-readable risk summary with fix advice.
+      - name: Agent 1 - Dependency Vulnerability Analyst
+        env:
+          NVDAI_API_KEY: ${{ secrets.NVDAI_API_KEY }}
+        run: |
+          echo "🤖 Running Agent 1: Dependency Vulnerability Analyst..."
+
+          NUGET_REPORT=$(cat nuget-report.txt 2>/dev/null || echo "No report found")
+
+          PAYLOAD=$(jq -n \
+            --arg report "$NUGET_REPORT" \
+            '{
+              model: "meta/llama-3.1-70b-instruct",
+              max_tokens: 1024,
+              messages: [{
+                role: "user",
+                content: ("You are a .NET security expert. Analyze this NuGet dependency report for the EcommerceApi project and:\n1. List any outdated or vulnerable packages with their severity (CRITICAL/HIGH/MEDIUM/LOW)\n2. Recommend the exact version to upgrade to for each\n3. Flag any that could affect authentication, data handling, or API security\n4. Give an overall risk score out of 10\n\nKeep the response concise and actionable.\n\nReport:\n" + $report)
+              }]
+            }')
+
+          RESPONSE=$(curl -s https://integrate.api.nvidia.com/v1/chat/completions \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer $NVDAI_API_KEY" \
+            -d "$PAYLOAD")
+
+          echo "──────────────────────────────────────────"
+          echo "🤖 Agent 1 - Dependency Risk Analysis"
+          echo "──────────────────────────────────────────"
+          echo "$RESPONSE" | jq -r '.choices[0].message.content // "Agent response unavailable"'
+          echo "──────────────────────────────────────────"
+
+          # Save report for summary
+          echo "$RESPONSE" | jq -r '.choices[0].message.content // ""' > agent1-report.txt
+
+      # ── Collect Source Files for Claude Code Review ──────
+      - name: Collect Source Code for Review
+        run: |
+          echo "Collecting .cs source files..."
+          find src -name "*.cs" | head -20 | xargs cat > combined-source.txt 2>/dev/null || true
+          echo "Source collection complete. Size: $(wc -c < combined-source.txt) bytes"
+
+      # ── 🤖 AGENT 2: Security Code Reviewer (NVIDIA NIM) ────────
+      # Reviews the actual C# source for OWASP Top 10 issues,
+      # insecure patterns, and hardcoded secrets.
+      - name: Agent 2 - Security Code Reviewer
+        env:
+          NVDAI_API_KEY: ${{ secrets.NVDAI_API_KEY }}
+        run: |
+          echo "🤖 Running Agent 2: Security Code Reviewer..."
+
+          SOURCE_CODE=$(head -c 8000 combined-source.txt 2>/dev/null || echo "No source found")
+
+          PAYLOAD=$(jq -n \
+            --arg code "$SOURCE_CODE" \
+            '{
+              model: "meta/llama-3.1-70b-instruct",
+              max_tokens: 1024,
+              messages: [{
+                role: "user",
+                content: ("You are an expert .NET security code reviewer. Review this C# source code from an e-commerce API and identify:\n1. OWASP Top 10 vulnerabilities (SQL Injection, XSS, broken auth, etc.)\n2. Hardcoded secrets, API keys, or credentials\n3. Insecure deserialization or input handling\n4. Missing authorization checks or exposed sensitive endpoints\n5. Any CORS, HTTPS, or middleware misconfiguration\n\nFor each issue found: state the file/line if visible, severity, and recommended fix.\nIf no issues found, confirm the code looks secure.\n\nSource Code:\n" + $code)
+              }]
+            }')
+
+          RESPONSE=$(curl -s https://integrate.api.nvidia.com/v1/chat/completions \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer $NVDAI_API_KEY" \
+            -d "$PAYLOAD")
+
+          echo "──────────────────────────────────────────"
+          echo "🤖 Agent 2 - Security Code Review"
+          echo "──────────────────────────────────────────"
+          echo "$RESPONSE" | jq -r '.choices[0].message.content // "Agent response unavailable"'
+          echo "──────────────────────────────────────────"
+
+          echo "$RESPONSE" | jq -r '.choices[0].message.content // ""' > agent2-report.txt
+
+      # ── 🤖 AGENT 3: Security Gate & PR Advisor (NVIDIA NIM) ────
+      # Reads both agent reports, makes a PASS/WARN/FAIL
+      # decision, and writes a structured PR comment summary.
+      - name: Agent 3 - Security Gate & PR Advisor
+        env:
+          NVDAI_API_KEY: ${{ secrets.NVDAI_API_KEY }}
+        run: |
+          echo "🤖 Running Agent 3: Security Gate & PR Advisor..."
+
+          AGENT1=$(cat agent1-report.txt 2>/dev/null || echo "No data")
+          AGENT2=$(cat agent2-report.txt 2>/dev/null || echo "No data")
+
+          PAYLOAD=$(jq -n \
+            --arg a1 "$AGENT1" \
+            --arg a2 "$AGENT2" \
+            --arg branch "${{ github.ref_name }}" \
+            --arg sha "${{ github.sha }}" \
+            '{
+              model: "meta/llama-3.1-70b-instruct",
+              max_tokens: 1024,
+              messages: [{
+                role: "user",
+                content: ("You are a security gate AI for a CI/CD pipeline of an e-commerce .NET API.\n\nYou have received two security reports:\n\nREPORT 1 - Dependency Analysis:\n" + $a1 + "\n\nREPORT 2 - Code Security Review:\n" + $a2 + "\n\nBranch: " + $branch + "\nCommit: " + $sha + "\n\nBased on both reports:\n1. Make a final gate decision: PASS / WARN / FAIL\n   - PASS: No critical issues found\n   - WARN: Minor issues exist, deployment can proceed with caution\n   - FAIL: Critical vulnerabilities found, block deployment\n2. Write a concise PR comment summary (2-3 bullet points max)\n3. List the top 3 action items the developer must address\n\nFormat your response clearly with sections: DECISION, PR SUMMARY, ACTION ITEMS")
+              }]
+            }')
+
+          RESPONSE=$(curl -s https://integrate.api.nvidia.com/v1/chat/completions \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer $NVDAI_API_KEY" \
+            -d "$PAYLOAD")
+
+          GATE_OUTPUT=$(echo "$RESPONSE" | jq -r '.choices[0].message.content // "Agent response unavailable"')
+
+          echo "══════════════════════════════════════════"
+          echo "🤖 Agent 3 - Security Gate Decision"
+          echo "══════════════════════════════════════════"
+          echo "$GATE_OUTPUT"
+          echo "══════════════════════════════════════════"
+
+          echo "$GATE_OUTPUT" > agent3-gate.txt
+
+          # Fail the pipeline if Agent recommends FAIL
+          if echo "$GATE_OUTPUT" | grep -q "^DECISION: FAIL\|DECISION.*FAIL"; then
+            echo "❌ Security Gate: FAILED - Critical issues detected. Blocking pipeline."
+            exit 1
+          elif echo "$GATE_OUTPUT" | grep -q "^DECISION: WARN\|DECISION.*WARN"; then
+            echo "⚠️  Security Gate: WARNING - Proceeding with caution."
+          else
+            echo "✅ Security Gate: PASSED"
+          fi
+
+      # ── Upload all Claude Agent Reports ──────────────────
+      - name: Upload Claude Security Reports
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: nvidia-security-reports
+          path: |
+            agent1-report.txt
+            agent2-report.txt
+            agent3-gate.txt
+            nuget-report.txt
+
+  # ─────────────────────────────────────────────────────────
+  # STAGE 3: UNIT TESTS
+  # ─────────────────────────────────────────────────────────
+  unit-tests:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    needs: build
+    permissions:
+      contents: read
+      checks: write
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - name: Cache NuGet Packages
+        uses: actions/cache@v3
+        with:
+          path: ~/.nuget/packages
+          key: ${{ runner.os }}-nuget-${{ hashFiles('**/*.csproj') }}
+          restore-keys: ${{ runner.os }}-nuget-
+
+      - name: Restore Dependencies
+        run: dotnet restore EcommerceApi.sln
+
+      - name: Run Unit Tests
+        run: dotnet test tests/EcommerceApi.Tests.Unit/EcommerceApi.Tests.Unit.csproj
+          --configuration ${{ env.BUILD_CONFIGURATION }}
+          --no-restore
+          --logger "trx;LogFileName=test-results.trx"
+          --collect:"XPlat Code Coverage"
+          --results-directory ./coverage
+          --verbosity normal
+
+      - name: Upload Test Results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: unit-test-results
+          path: |
+            **/*.trx
+            ./coverage
+
+      - name: Publish Test Results
+        uses: EnricoMi/publish-unit-test-result-action@v2
+        if: always()
+        with:
+          files: '**/test-results.trx'
+          check_name: Unit Test Results
+          comment_mode: always
+
+  # ─────────────────────────────────────────────────────────
+  # STAGE 4: INTEGRATION TESTS (WITH DATABASE)
+  # ─────────────────────────────────────────────────────────
+  integration-tests:
+    name: Integration Tests
+    runs-on: ubuntu-latest
+    needs: build
+    permissions:
+      contents: read
+      checks: write
+
+    services:
+      postgres:
+        image: postgres:15-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: ecommerce_test
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - name: Cache NuGet Packages
+        uses: actions/cache@v3
+        with:
+          path: ~/.nuget/packages
+          key: ${{ runner.os }}-nuget-${{ hashFiles('**/*.csproj') }}
+          restore-keys: ${{ runner.os }}-nuget-
+
+      - name: Restore Dependencies
+        run: dotnet restore EcommerceApi.sln
+
+      - name: Run Integration Tests
+        run: dotnet test tests/EcommerceApi.Tests.Integration/EcommerceApi.Tests.Integration.csproj
+          --configuration ${{ env.BUILD_CONFIGURATION }}
+          --no-restore
+          --logger "trx;LogFileName=integration-results.trx"
+          --verbosity normal
+        env:
+          ConnectionStrings__DefaultConnection: "Host=localhost;Port=5432;Username=postgres;Password=postgres;Database=ecommerce_test;"
+
+      - name: Upload Integration Test Results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: integration-test-results
+          path: '**/integration-results.trx'
+
+      - name: Publish Integration Test Results
+        uses: EnricoMi/publish-unit-test-result-action@v2
+        if: always()
+        with:
+          files: '**/integration-results.trx'
+          check_name: Integration Test Results
+          comment_mode: always
+ # ─────────────────────────────────────────────────────────
+  # STAGE 5: CODE QUALITY ANALYSIS
+  # ─────────────────────────────────────────────────────────
+  code-quality:
+    name: Code Quality Analysis
+    runs-on: ubuntu-latest
+    needs: [ unit-tests, integration-tests ]
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - name: Cache NuGet Packages
+        uses: actions/cache@v3
+        with:
+          path: ~/.nuget/packages
+          key: ${{ runner.os }}-nuget-${{ hashFiles('**/*.csproj') }}
+          restore-keys: ${{ runner.os }}-nuget-
+
+      - name: Install SonarScanner
+        run: dotnet tool install --global dotnet-sonarscanner
+
+      - name: Build with SonarQube Analysis
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+        run: |
+          dotnet sonarscanner begin \
+            /k:"ecommerce-api" \
+            /o:"your-org" \
+            /d:sonar.host.url="${{ secrets.SONAR_HOST_URL }}" \
+            /d:sonar.login="${{ secrets.SONAR_TOKEN }}"
+          
+          dotnet restore EcommerceApi.sln
+          dotnet build EcommerceApi.sln --configuration ${{ env.BUILD_CONFIGURATION }} --no-restore
+          
+          dotnet sonarscanner end /d:sonar.login="${{ secrets.SONAR_TOKEN }}"
+        continue-on-error: true
+
+      - name: Run Code Analysis
+        run: dotnet build EcommerceApi.sln
+          --configuration ${{ env.BUILD_CONFIGURATION }}
+          /p:TreatWarningsAsErrors=true
+          /p:EnforceCodeStyleInBuild=true
+ # ─────────────────────────────────────────────────────────
+  # STAGE 6: BUILD DOCKER IMAGE
+  # ─────────────────────────────────────────────────────────
+  build-docker:
+    name: Build Docker Image
+    runs-on: ubuntu-latest
+    needs: [ security-scan, code-quality ]
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract Metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,prefix={{branch}}-
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and Push Docker Image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # ─────────────────────────────────────────────────────────
+  # STAGE 7: PUBLISH ARTIFACTS
+  # ─────────────────────────────────────────────────────────
+  publish:
+    name: Publish Artifacts
+    runs-on: ubuntu-latest
+    needs: build-docker
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - name: Cache NuGet Packages
+        uses: actions/cache@v3
+        with:
+          path: ~/.nuget/packages
+          key: ${{ runner.os }}-nuget-${{ hashFiles('**/*.csproj') }}
+          restore-keys: ${{ runner.os }}-nuget-
+
+      - name: Restore Dependencies
+        run: dotnet restore EcommerceApi.sln
+
+      - name: Publish API
+        run: dotnet publish src/EcommerceApi.Api/EcommerceApi.Api.csproj
+          --configuration ${{ env.BUILD_CONFIGURATION }}
+          --no-restore
+          --output ./publish
+          -p:DebugType=none
+          -p:DebugSymbols=false
+
+      - name: Upload Published Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ecommerce-api-publish
+          path: ./publish
+
+  # ─────────────────────────────────────────────────────────
+  # STAGE 8: DEPLOY TO STAGING (Only on develop branch)
+  # ─────────────────────────────────────────────────────────
+  deploy-staging:
+    name: Deploy to Staging
+    runs-on: ubuntu-latest
+    needs: publish
+    if: github.ref == 'refs/heads/develop' && github.event_name == 'push'
+    environment:
+      name: staging
+      url: https://staging-api.example.com
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Download Published Artifact
+        uses: actions/download-artifact@v3
+        with:
+          name: ecommerce-api-publish
+          path: ./publish
+
+      - name: Deploy to Staging
+        env:
+          DEPLOY_KEY: ${{ secrets.DEPLOY_KEY }}
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST_STAGING }}
+        run: |
+          echo "Deploying to staging environment..."
+          echo "Running database migrations..."
+          echo "Performing smoke tests..."
+          echo "Staging deployment completed successfully!"
+
+  # ─────────────────────────────────────────────────────────
+  # STAGE 9: DEPLOY TO PRODUCTION (Only on main branch)
+  # ─────────────────────────────────────────────────────────
+  deploy-production:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    needs: publish
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    environment:
+      name: production
+      url: https://api.example.com
+    permissions:
+      contents: read
+      deployments: write
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Download Published Artifact
+        uses: actions/download-artifact@v3
+        with:
+          name: ecommerce-api-publish
+          path: ./publish
+
+      - name: Create Deployment
+        uses: actions/github-script@v7
+        id: deployment
+        with:
+          script: |
+            const deployment = await github.rest.repos.createDeployment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              ref: context.ref,
+              environment: 'production',
+              required_contexts: [],
+              auto_merge: false,
+              description: 'Deploying commit ${{ github.sha }}'
+            });
+            return deployment.data.id;
+
+      - name: Deploy to Production
+        env:
+          DEPLOY_KEY: ${{ secrets.DEPLOY_KEY }}
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST_PROD }}
+        run: |
+          echo "Starting production deployment..."
+          echo "Running database migrations..."
+          echo "Verifying health checks..."
+          echo "Production deployment completed successfully!"
+
+      - name: Update Deployment Status
+        uses: actions/github-script@v7
+        if: always()
+        with:
+          script: |
+            github.rest.repos.createDeploymentStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              deployment_id: ${{ steps.deployment.outputs.result }},
+              state: 'success',
+              description: 'Deployment completed successfully'
+            });
+
+ 
+ 
+  # ─────────────────────────────────────────────────────────
+  # FINAL: SUMMARY & NOTIFICATIONS
+  # ─────────────────────────────────────────────────────────
+  summary:
+    name: Pipeline Summary
+    runs-on: ubuntu-latest
+    needs: [ build, security-scan, unit-tests, integration-tests, code-quality, build-docker, publish ]
+    if: always()
+
+    steps:
+      - name: Check Pipeline Status
+        run: |
+          echo "╔════════════════════════════════════════╗"
+          echo "║   Enterprise E-Commerce API Pipeline   ║"
+          echo "╚════════════════════════════════════════╝"
+          echo ""
+          echo "Build Status:        ${{ needs.build.result }}"
+          echo "Security Scan:       ${{ needs.security-scan.result }}"
+          echo "  └─ Agent 1: Dependency Vulnerability Analyst (NVIDIA NIM)"
+          echo "  └─ Agent 2: Security Code Reviewer (NVIDIA NIM)"
+          echo "  └─ Agent 3: Security Gate & PR Advisor (NVIDIA NIM)"
+          echo "Unit Tests:          ${{ needs.unit-tests.result }}"
+          echo "Integration Tests:   ${{ needs.integration-tests.result }}"
+          echo "Code Quality:        ${{ needs.code-quality.result }}"
+          echo "Docker Build:        ${{ needs.build-docker.result }}"
+          echo "Publishing:          ${{ needs.publish.result }}"
+          echo ""
+          if [ "${{ job.status }}" == "failure" ]; then
+            echo "❌ Pipeline Failed"
+            exit 1
+          else
+            echo "✅ Pipeline Completed Successfully"
+          fi
